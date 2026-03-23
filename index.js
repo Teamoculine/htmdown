@@ -3,7 +3,6 @@ import fetch, { AbortError } from "node-fetch";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
-import rateLimit from "express-rate-limit";
 
 const app = express();
 app.use(express.json());
@@ -22,15 +21,7 @@ const JUNK_SELECTORS = [
 ];
 
 const ALLOWED_MODES = ["reader", "full"];
-const HTML_SIZE_LIMIT = 2_000_000; 
-
-const limiter = rateLimit({
-  windowMs: 60 * 1000, 
-  max: 20, 
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use(limiter);
+const HTML_SIZE_LIMIT = 2_000_000;
 
 const cache = new Map();
 function getCache(key) {
@@ -39,7 +30,7 @@ function getCache(key) {
   if (Date.now() > item.expiry) { cache.delete(key); return null; }
   return item.data;
 }
-function setCache(key, data, ttl = 60000) { 
+function setCache(key, data, ttl = 60000) {
   cache.set(key, { data, expiry: Date.now() + ttl });
 }
 
@@ -60,9 +51,7 @@ async function fetchPage(url) {
     }
 
     const html = await res.text();
-
     if (html.length > HTML_SIZE_LIMIT) throw new Error("Page too large");
-
     return html;
   } catch (err) {
     if (err instanceof AbortError) throw new Error("Request timeout");
@@ -108,6 +97,33 @@ function validateURL(url) {
   return parsed;
 }
 
+async function handleRequest(url, mode, res) {
+  if (!ALLOWED_MODES.includes(mode)) return res.status(400).json({ error: "Invalid mode" });
+
+  try {
+    validateURL(url);
+
+    const cacheKey = `${mode}:${url}`;
+    const cached = getCache(cacheKey);
+    if (cached) return res.send(cached);
+
+    const html = await fetchPage(url);
+
+    if (mode === "full") {
+      res.set("Content-Type", "text/html; charset=utf-8");
+      setCache(cacheKey, html);
+      return res.send(html);
+    }
+
+    const result = extractMarkdown(html, url);
+    setCache(cacheKey, result);
+    return res.json(result);
+
+  } catch (err) {
+    return res.status(502).json({ error: err.message });
+  }
+}
+
 app.get("/", async (req, res) => {
   const { url, mode = "reader" } = req.query;
 
@@ -120,67 +136,19 @@ app.get("/", async (req, res) => {
     },
   });
 
-  if (!ALLOWED_MODES.includes(mode)) return res.status(400).json({ error: "Invalid mode" });
-
-  try {
-    validateURL(url);
-
-    const cacheKey = `${mode}:${url}`;
-    const cached = getCache(cacheKey);
-    if (cached) return res.send(cached);
-
-    const html = await fetchPage(url);
-
-    if (mode === "full") {
-      res.set("Content-Type", "text/html; charset=utf-8");
-      setCache(cacheKey, html);
-      return res.send(html);
-    }
-
-    const result = extractMarkdown(html, url);
-    setCache(cacheKey, result);
-    return res.json(result);
-
-  } catch (err) {
-    return res.status(502).json({ error: err.message });
-  }
+  return handleRequest(url, mode, res);
 });
 
 app.post("/", async (req, res) => {
   const { url, mode = "reader" } = req.body;
-
   if (!url || typeof url !== "string") return res.status(400).json({ error: "Missing or invalid url field" });
-  if (!ALLOWED_MODES.includes(mode)) return res.status(400).json({ error: "Invalid mode" });
-
-  try {
-    validateURL(url);
-
-    const cacheKey = `${mode}:${url}`;
-    const cached = getCache(cacheKey);
-    if (cached) return res.send(cached);
-
-    const html = await fetchPage(url);
-
-    if (mode === "full") {
-      res.set("Content-Type", "text/html; charset=utf-8");
-      setCache(cacheKey, html);
-      return res.send(html);
-    }
-
-    const result = extractMarkdown(html, url);
-    setCache(cacheKey, result);
-    return res.json(result);
-
-  } catch (err) {
-    return res.status(502).json({ error: err.message });
-  }
+  return handleRequest(url, mode, res);
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`htmdown running on port ${PORT}`));
 
 const SELF_URL = process.env.SELF_URL || `http://localhost:${PORT}/`;
-
 setInterval(async () => {
   try {
     console.log(`[SELF-PING] Pinging ${SELF_URL}`);
@@ -189,3 +157,4 @@ setInterval(async () => {
     console.warn("[SELF-PING] Error:", err.message);
   }
 }, 10 * 60 * 1000);
+  
